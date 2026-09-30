@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Face Mesh &amp; Emotion Console</title>
+<style>
+:root{--bg:#0b1020;--panel:#131a30;--line:#25304f;--txt:#e7ecf8;--mut:#8b97b8;--acc:#00e5ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 24px;border-bottom:1px solid var(--line)}
+h1{font-size:17px;margin:0;font-weight:600}#status{color:var(--mut);font-size:13px}
+main{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:16px;padding:16px 24px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:0 0 10px}
+.stage{position:relative;aspect-ratio:4/3;background:#000;border-radius:8px;overflow:hidden}
+.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1);object-fit:cover}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tag{position:absolute;left:8px;top:6px;z-index:2;font-size:11px;color:var(--mut);letter-spacing:.06em;text-transform:uppercase}
+.side{display:flex;flex-direction:column;gap:16px}
+button{background:var(--acc);color:#001318;border:0;border-radius:6px;padding:9px 16px;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.sw{display:inline-block;width:14px;height:14px;border-radius:50%;vertical-align:middle;margin-right:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}td{padding:3px 0;color:var(--mut)}td b{color:var(--txt)}
+.card{border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px}
+.card .lab{font-size:18px;font-weight:600}
+.bar{height:6px;background:#1c2542;border-radius:3px;margin:3px 0 6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc)}
+.row{display:flex;justify-content:space-between;font-size:12px;color:var(--mut)}
+small{color:var(--mut)}
+</style></head><body>
+<header><h1>Live Face Mesh &amp; Emotion Console</h1><div><span id="status">Idle</span> &nbsp; <button id="go">Start camera</button> <button id="stop" disabled style="background:#ff3b30;color:#fff">Stop camera</button></div></header>
+<main>
+ <section><h2>1 &middot; Face mesh (live)</h2>
+  <div class="pair">
+   <div class="stage"><span class="tag">Camera</span><video id="v" playsinline muted></video></div>
+   <div class="stage" style="background:#05070f"><span class="tag">Mesh</span><canvas id="c"></canvas></div>
+  </div>
+  <small>The mesh is drawn in its own panel, tracking your head position. Its colour changes with hand gestures.</small></section>
+ <div class="side">
+  <section><h2>2 &middot; Gesture control</h2>
+   <div style="font-size:18px;font-weight:600"><span class="sw" id="sw"></span><span id="gname">None</span></div>
+   <table><tr><td>Open palm</td><td><b style="color:#00e5ff">cyan</b></td></tr>
+   <tr><td>Victory</td><td><b style="color:#39ff14">green</b></td></tr>
+   <tr><td>Thumb up</td><td><b style="color:#ffd60a">yellow</b></td></tr>
+   <tr><td>Closed fist</td><td><b style="color:#ff3b30">red</b></td></tr>
+   <tr><td>Point up</td><td><b style="color:#ff2ee6">magenta</b></td></tr>
+   <tr><td>Thumb down</td><td><b style="color:#ff9500">orange</b></td></tr>
+   <tr><td>I-love-you</td><td><b style="color:#ff6ec7">pink</b></td></tr></table></section>
+  <section><h2>3 &middot; Emotion (per face)</h2><div id="emo"><small>No face detected.</small></div>
+   <small>Heuristic from face blendshapes, not a trained classifier. Use with consent.</small></section>
+ </div>
+</main>
+<script type="module">
+import {FaceLandmarker,GestureRecognizer,FilesetResolver,DrawingUtils} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const FACE="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const GEST="https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task";
+const COLORS={Open_Palm:"#00e5ff",Victory:"#39ff14",Thumb_Up:"#ffd60a",Closed_Fist:"#ff3b30",Pointing_Up:"#ff2ee6",Thumb_Down:"#ff9500",ILoveYou:"#ff6ec7"};
+const $=id=>document.getElementById(id), v=$("v"), c=$("c"), ctx=c.getContext("2d"), st=$("status");
+let face,gest,color="#00e5ff",last=-1,lastUI=0; const ema={};
+const avg=(b,...k)=>k.reduce((s,n)=>s+(b[n]||0),0)/k.length;
+
+function emotion(b){
+  const s={
+    Happy:Math.min(1,avg(b,"mouthSmileLeft","mouthSmileRight")*1.6),
+    Surprised:0.35*(b.browInnerUp||0)+0.35*avg(b,"eyeWideLeft","eyeWideRight")+0.3*(b.jawOpen||0),
+    Angry:0.6*avg(b,"browDownLeft","browDownRight")+0.2*avg(b,"noseSneerLeft","noseSneerRight")+0.2*avg(b,"mouthPressLeft","mouthPressRight"),
+    Sad:0.6*avg(b,"mouthFrownLeft","mouthFrownRight")+0.4*(b.browInnerUp||0),
+  };
+  s.Neutral=0.3; return s;
+}
+function render(scores){
+  if(!scores.length){$("emo").innerHTML="<small>No face detected.</small>";return;}
+  $("emo").innerHTML=scores.map((s,i)=>{
+    const top=Object.entries(s).sort((a,b)=>b[1]-a[1])[0][0];
+    return `<div class="card"><div class="row"><span>Student ${i+1}</span></div><div class="lab">${top}</div>`+
+      Object.entries(s).map(([k,x])=>`<div class="row"><span>${k}</span><span>${Math.round(Math.min(1,x)*100)}%</span></div><div class="bar"><i style="width:${Math.min(1,x)*100}%"></i></div>`).join("")+`</div>`;
+  }).join("");
+}
+async function init(){
+  st.textContent="Loading models...";
+  const fs=await FilesetResolver.forVisionTasks(WASM);
+  face=await FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:FACE,delegate:"GPU"},runningMode:"VIDEO",numFaces:4,outputFaceBlendshapes:true});
+  gest=await GestureRecognizer.createFromOptions(fs,{baseOptions:{modelAssetPath:GEST,delegate:"GPU"},runningMode:"VIDEO",numHands:1});
+}
+function loop(){
+  if(v.readyState>=2&&v.currentTime!==last){
+    last=v.currentTime; const t=performance.now();
+    const f=face.detectForVideo(v,t), g=gest.recognizeForVideo(v,t);
+    const gg=g.gestures?.[0]?.[0];
+    if(gg&&gg.score>0.6&&COLORS[gg.categoryName]){color=COLORS[gg.categoryName];$("gname").textContent=gg.categoryName.replace("_"," ");$("sw").style.background=color;}
+    ctx.clearRect(0,0,c.width,c.height); const du=new DrawingUtils(ctx);
+    (f.faceLandmarks||[]).forEach(lm=>{
+      du.drawConnectors(lm,FaceLandmarker.FACE_LANDMARKS_TESSELATION,{color:color+"66",lineWidth:0.6});
+      du.drawConnectors(lm,FaceLandmarker.FACE_LANDMARKS_CONTOURS,{color:color,lineWidth:1.6});
+    });
+    if(t-lastUI>200){ lastUI=t;
+      const out=(f.faceBlendshapes||[]).map((fb,i)=>{
+        const b={}; fb.categories.forEach(x=>b[x.categoryName]=x.score);
+        const s=emotion(b); ema[i]=ema[i]||s;
+        for(const k in s) ema[i][k]=0.7*ema[i][k]+0.3*s[k];
+        return {...ema[i]};
+      }); render(out);
+    }
+  }
+  raf=requestAnimationFrame(loop);
+}
+let raf=0,stream=null;
+$("go").onclick=async()=>{
+  $("go").disabled=true;
+  try{
+    if(!face) await init();
+    stream=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:960,facingMode:"user"},audio:false});
+    v.srcObject=stream; await v.play();
+    c.width=v.videoWidth; c.height=v.videoHeight;
+    last=-1; st.textContent="Live"; $("stop").disabled=false; loop();
+  }catch(e){st.textContent="Error: "+e.message;$("go").disabled=false;}
+};
+$("stop").onclick=()=>{
+  cancelAnimationFrame(raf);
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  v.srcObject=null; ctx.clearRect(0,0,c.width,c.height);
+  for(const k in ema) delete ema[k];
+  render([]); $("gname").textContent="None"; $("sw").style.background="transparent"; color="#00e5ff";
+  st.textContent="Stopped"; $("stop").disabled=true; $("go").disabled=false;
+};
+</script></body></html>
